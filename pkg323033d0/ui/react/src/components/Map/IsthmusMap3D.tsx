@@ -205,27 +205,111 @@ const PLAYBACK_SECONDS = 9;
 /* --- chase camera ---
  *
  * The shot that rides along with the unit. Every value here is tuned to one idea: the
- * camera is a helicopter with a pilot, not a rail. It trails slightly behind the
- * vehicle, it banks into turns a beat late, and it never reaches its target exactly —
- * which is what separates "following" from "glued to".
+ * camera is a helicopter with a patient pilot, not a rail and not a chase car. It keeps
+ * the vehicle in the middle of the frame, but it is allowed to be slow about *how* it
+ * looks at it: a corner is answered by rising slightly and panning round over a second
+ * or two, never by snapping to the new heading.
+ *
+ * Because the camera is centred on the vehicle, the *only* term that has to keep up is
+ * position. Bearing, zoom and pitch can lag as far behind as looks good without any
+ * risk of losing the unit off the edge of the frame — which is what makes the very lazy
+ * rotation values below safe.
  */
 /** Height to settle at while following. Close enough to read street names. */
 const FOLLOW_ZOOM = 15.5;
 const FOLLOW_PITCH = 62;
 /**
  * Per-frame approach fraction at 60 fps, normalised for real frame time below so a
- * 120 Hz display does not chase twice as fast. Deliberately lazy: the lag is the shot.
+ * 120 Hz display does not chase twice as fast. This is the keep-up term, so it is the
+ * one value here that is not lazy.
  */
 const FOLLOW_EASE = 0.085;
-/** Turning and zooming lag further behind than position — a camera has inertia. */
-const FOLLOW_TURN_EASE = 0.045;
+/**
+ * If smoothing ever leaves the camera further behind than this (metres on the ground —
+ * a long straight at speed, or a frame-rate stall), the position ease firms up in
+ * proportion until the gap closes. A guard rail, not a normal part of the shot.
+ */
+const FOLLOW_LAG_CATCHUP_M = 220;
+/**
+ * The camera aims at the average heading of this much of the road just driven — a long
+ * window, deliberately. Nine seconds of playback covers a couple of kilometres, so a
+ * corner is over in about half a second of wall clock; a camera aimed at the *local*
+ * heading would therefore have to whip round for every turn, and (at any rate slow
+ * enough to look calm) would simply never catch up. Aiming at the long-run direction
+ * instead means a single corner barely moves the target, so the camera drifts rather
+ * than chases, and the shot stays level through a twisty stretch.
+ */
+const FOLLOW_HEADING_LOOKBACK_M = 600;
+/**
+ * The curvature probe: a short window compared against the long one above. When the
+ * road bends, the near heading swings ahead of the far heading and the difference grows
+ * — a measure of how hard the *road* is turning, independent of how far behind the
+ * camera happens to be. That is what drives the lift, so the widening lands on the
+ * corner itself instead of trailing the camera's own lag.
+ */
+const FOLLOW_CURVE_WINDOW_M = 150;
+/** Rotation ease. Very lazy on purpose — see the note about centring above. */
+const FOLLOW_TURN_EASE = 0.016;
+/**
+ * Hard ceiling on rotation, in degrees per second, applied after the ease. The ease
+ * alone still opens a sharp corner fast (its first frames are its biggest); this is
+ * what guarantees a hard left reads as a slow pan however abrupt the road is.
+ */
+const FOLLOW_TURN_MAX_DPS = 24;
+/** Zoom and pitch ease, slower again than position: height should drift, not step. */
+const FOLLOW_HEIGHT_EASE = 0.03;
+/* --- widening into the turn ---
+ *
+ * Instead of swinging the camera round a corner, the camera lifts a little and turns
+ * slowly underneath that lift. Rising first is what makes the slow turn legible: from
+ * higher up, the same rotation covers less apparent distance on screen.
+ */
+/** Bearing error that counts as a full turn, in degrees. */
+const FOLLOW_TURN_FULL_DEG = 55;
+/** How fast the widening comes in and goes out. Slower than the turn it answers. */
+const FOLLOW_TURN_LOAD_EASE = 0.018;
+/** Zoom levels given up at a full turn, and degrees of pitch laid back. */
+const FOLLOW_TURN_ZOOM_OUT = 0.85;
+const FOLLOW_TURN_PITCH_DROP = 9;
+/**
+ * The hand-over from the dive. The chase zoom and pitch are blended in over this window
+ * so the ride-along *continues* the dive rather than arriving as a second, competing
+ * move.
+ */
+const FOLLOW_SETTLE_MS = 1400;
+/* --- the establishing sweep, run once per leg, and not optional ---
+ *
+ * At the start the dive leaves the camera facing wherever it last pointed — possibly a
+ * half turn from the route — and at the hospital hand-off the second leg can set off
+ * back the way the unit came. Either way the settled ceiling above would still be
+ * coming round when the unit arrived. So each leg opens with one deliberate eased turn
+ * onto its heading: at the start it lands under the dive, which is still visibly
+ * settling, and at the hand-off it lands under the lift, so the camera rises, turns and
+ * descends as one move. After that the lazy ceiling governs and the camera barely
+ * rotates again.
+ *
+ * The sweep is budgeted by *rate*, not by a fixed window: a fixed window turns a small
+ * correction into a crawl and a half-turn into a whip pan. Pick the speed that looks
+ * like an operator panning, then let the length follow from how far there is to go.
+ */
+/** Average sweep rate, °/s. The eased peak is about π/2 × this. */
+const FOLLOW_ORIENT_DPS = 55;
+/** Floor and ceiling on the sweep's length, so it is neither a blink nor the whole drive. */
+const FOLLOW_ORIENT_MIN_MS = 600;
+const FOLLOW_ORIENT_MAX_MS = 2200;
+/**
+ * Ceiling on any single sweep frame, °/s. The share-of-remaining maths below hands the
+ * last of the error to the final frames, which would snap if the heading drifted late
+ * in a sweep; this turns that into a tail the settled ease finishes off.
+ */
+const FOLLOW_ORIENT_MAX_DPS = 2.5 * FOLLOW_ORIENT_DPS;
 /**
  * The breath at the hand-off. When the unit reaches the scene and the second leg
  * begins, the camera lifts and settles back over this window, so the viewer feels the
  * patient being loaded instead of reading a label that says so.
  */
-const FOLLOW_LIFT_MS = 1200;
-const FOLLOW_LIFT_ZOOM = 1.25;
+const FOLLOW_LIFT_MS = 1900;
+const FOLLOW_LIFT_ZOOM = 0.9;
 
 /* --- arrival flash and vehicle beacon --- */
 /** How long an arrival ring takes to expand and fade out. */
@@ -245,6 +329,15 @@ function easeOutCubic(t: number): number {
   return 1 - Math.pow(1 - t, 3);
 }
 
+/**
+ * Slow in, slow out — the shape of a camera operator's pan. Sine rather than cubic on
+ * purpose: cubic ease-in-out peaks at three times its average rate, which turns a long
+ * pan into a whip. Sine peaks at π/2 ≈ 1.57×, so the middle of the move stays readable.
+ */
+function easeInOutSine(t: number): number {
+  return 0.5 * (1 - Math.cos(Math.PI * t));
+}
+
 /** Compass bearing a→b in MapLibre's degrees-clockwise-from-north. */
 function bearingBetween(a: [number, number], b: [number, number]): number {
   const toRad = Math.PI / 180;
@@ -255,10 +348,46 @@ function bearingBetween(a: [number, number], b: [number, number]): number {
   return (Math.atan2(y, x) * 180) / Math.PI;
 }
 
-/** Interpolates angles the short way round, so 350° → 10° turns 20° and not 340°. */
-function lerpAngle(from: number, to: number, t: number): number {
-  const delta = ((to - from + 540) % 360) - 180;
-  return from + delta * t;
+/**
+ * Signed degrees from `from` to `to` the short way round: always in (−180, 180], so
+ * 350° → 10° is +20 and not −340. Everything that turns the camera goes through this.
+ */
+function shortestAngle(from: number, to: number): number {
+  return ((to - from + 540) % 360) - 180;
+}
+
+/**
+ * The direction the vehicle has been travelling, averaged over the last
+ * `lookbackMeters` of road rather than read off the current polyline segment.
+ *
+ * OSM road geometry is a chain of short segments — frequently 10–20 m — and a city
+ * street is never quite straight, so a per-segment bearing jitters constantly and
+ * swings hard at every intersection. Walking back a fixed *distance* instead gives the
+ * heading of the stretch just driven, which is both stable and what a pilot would
+ * actually be pointing at.
+ *
+ * Returns null when too little road has been driven to mean anything (the first metres
+ * of a leg), so the caller can hold its current bearing instead of snapping to the
+ * direction of one stub of geometry.
+ *
+ * @param trail  the driven part of the leg, in order, ending at `head`
+ * @param head   the vehicle's current position, `[lon, lat]`
+ */
+function trailHeading(
+  trail: [number, number][],
+  head: [number, number],
+  lookbackMeters: number,
+): number | null {
+  let accrued = 0;
+  let previous = head;
+  for (let i = trail.length - 1; i >= 0; i--) {
+    accrued += metersBetween(previous, trail[i]);
+    previous = trail[i];
+    if (accrued >= lookbackMeters) return bearingBetween(trail[i], head);
+  }
+  // Short leg, or the first moments of one: usable only if it is long enough that the
+  // direction is real and not the rounding of a single vertex.
+  return accrued > 25 && trail.length > 0 ? bearingBetween(trail[0], head) : null;
 }
 
 function escapeHtml(value: string): string {
@@ -1393,6 +1522,12 @@ export default function IsthmusMap3D({
       legAt: 0,
       released: false,
       last: 0,
+      /** Smoothed 0–1 "how hard is the road bending", driving the lift-and-pan. */
+      turn: 0,
+      /** When this leg's establishing sweep began, how long it gets, and its progress. */
+      orientAt: 0,
+      orientMs: FOLLOW_ORIENT_MIN_MS,
+      orientProgress: 0,
     };
     // A `flyTo` from the dive may still be in flight, and it writes the transform every
     // frame — without this the chase would silently lose every frame to it.
@@ -1516,6 +1651,10 @@ export default function IsthmusMap3D({
         if (headLeg !== cam.leg) {
           cam.leg = headLeg;
           cam.legAt = now;
+          // Each leg earns its own establishing sweep, armed here and started on the
+          // first frame that has enough road driven to read a heading from.
+          cam.orientAt = 0;
+          cam.orientProgress = 0;
         }
 
         /*
@@ -1525,14 +1664,29 @@ export default function IsthmusMap3D({
          */
         const dt = cam.last ? Math.min(64, now - cam.last) : 16.7;
         cam.last = now;
-        const k = 1 - Math.pow(1 - FOLLOW_EASE, dt / 16.7);
-        const kTurn = 1 - Math.pow(1 - FOLLOW_TURN_EASE, dt / 16.7);
+        const approach = (ease: number) => 1 - Math.pow(1 - ease, dt / 16.7);
+        const kHeight = approach(FOLLOW_HEIGHT_EASE);
 
-        // Heading comes from the stretch just driven, so the camera banks the way the
-        // vehicle actually turned instead of pointing at a straight line to the end.
+        /*
+         * Two readings of the same trail: where the road has been going overall, and
+         * where it is going right now. The camera aims at the first and takes its cue to
+         * rise from the gap between them. Neither is read off the current polyline
+         * segment, so a kink in the geometry or a crossing cannot kick the view, and a
+         * null (too little road driven to mean anything) holds what we have.
+         */
         const trail = headTrail ?? [];
-        const from = trail.length >= 2 ? trail[trail.length - 2] : legs[headLeg].coords[0];
-        const aimed = metersBetween(from, head.point) > 1 ? bearingBetween(from, head.point) : cam.bearing;
+        const far = trailHeading(trail, head.point, FOLLOW_HEADING_LOOKBACK_M);
+        const near = trailHeading(trail, head.point, FOLLOW_CURVE_WINDOW_M);
+        const aimed = far ?? near ?? cam.bearing;
+
+        /*
+         * Answer a corner by rising, not by swinging. `turn` is how hard the road is
+         * bending — the near heading running ahead of the far one — smoothed slower than
+         * the bend itself, so the widening arrives and leaves as one slow breath rather
+         * than flickering with every wobble in the road.
+         */
+        const bend = far !== null && near !== null ? Math.abs(shortestAngle(far, near)) : 0;
+        cam.turn += (Math.min(1, bend / FOLLOW_TURN_FULL_DEG) - cam.turn) * approach(FOLLOW_TURN_LOAD_EASE);
 
         // One lift as the second leg takes over: the unit has reached the scene.
         const sinceLeg = now - cam.legAt;
@@ -1540,18 +1694,67 @@ export default function IsthmusMap3D({
           headLeg > 0 && sinceLeg < FOLLOW_LIFT_MS
             ? Math.sin((sinceLeg / FOLLOW_LIFT_MS) * Math.PI) * FOLLOW_LIFT_ZOOM
             : 0;
-        // Ease the target in over the first half second so the hand-over from the dive
-        // is a continuation of that move rather than a second, competing one.
-        const settle = easeOutCubic(Math.min(1, (now - start) / 900));
-        const wantZoom = cam.zoom + (FOLLOW_ZOOM - lift - cam.zoom) * settle;
+        // Blend the chase target in so the hand-over from the dive is a continuation of
+        // that move rather than a second, competing one.
+        const settle = easeOutCubic(Math.min(1, (now - start) / FOLLOW_SETTLE_MS));
+        const kTurn = approach(FOLLOW_TURN_EASE);
+        const zoomTarget = FOLLOW_ZOOM - lift - FOLLOW_TURN_ZOOM_OUT * cam.turn;
+        const pitchTarget = FOLLOW_PITCH - FOLLOW_TURN_PITCH_DROP * cam.turn;
+        const wantZoom = cam.zoom + (zoomTarget - cam.zoom) * settle;
+        const wantPitch = cam.pitch + (pitchTarget - cam.pitch) * settle;
 
+        /*
+         * Position is the one term allowed to hurry: the vehicle must stay in frame and
+         * must not appear to slow down because the camera did. Normally this is the
+         * plain lazy ease; if the gap ever opens past `FOLLOW_LAG_CATCHUP_M` the ease
+         * firms up in proportion until it closes again.
+         */
+        const lagMeters = metersBetween(cam.center, head.point);
+        const urgency = Math.max(1, lagMeters / FOLLOW_LAG_CATCHUP_M);
+        const kCenter = Math.min(1, approach(FOLLOW_EASE) * urgency);
         cam.center = [
-          cam.center[0] + (head.point[0] - cam.center[0]) * k,
-          cam.center[1] + (head.point[1] - cam.center[1]) * k,
+          cam.center[0] + (head.point[0] - cam.center[0]) * kCenter,
+          cam.center[1] + (head.point[1] - cam.center[1]) * kCenter,
         ];
-        cam.zoom += (wantZoom - cam.zoom) * k;
-        cam.bearing = lerpAngle(cam.bearing, aimed, kTurn);
-        cam.pitch += (FOLLOW_PITCH - cam.pitch) * kTurn;
+
+        cam.zoom += (wantZoom - cam.zoom) * kHeight;
+        cam.pitch += (wantPitch - cam.pitch) * kHeight;
+
+        const toAim = shortestAngle(cam.bearing, aimed);
+        if (far !== null && cam.orientAt === 0) {
+          // Arm the sweep for this leg, long enough to cover the turn at the sweep rate.
+          cam.orientAt = now;
+          cam.orientMs = Math.min(
+            FOLLOW_ORIENT_MAX_MS,
+            Math.max(FOLLOW_ORIENT_MIN_MS, (Math.abs(toAim) / FOLLOW_ORIENT_DPS) * 1000),
+          );
+        }
+
+        if (cam.orientAt > 0 && now - cam.orientAt < cam.orientMs) {
+          /*
+           * The establishing sweep. Rather than easing toward the heading and hoping to
+           * arrive, take the share of the *remaining* error that puts the whole turn on
+           * an ease-in-out curve finishing exactly at the deadline. Expressed this way
+           * the sweep still lands on time if the heading drifts mid-turn, and it
+           * decelerates into the settled shot instead of stopping dead.
+           */
+          const progress = Math.min(1, (now - cam.orientAt) / cam.orientMs);
+          const was = easeInOutSine(cam.orientProgress);
+          const isNow = easeInOutSine(progress);
+          cam.orientProgress = progress;
+          const share = was < 1 ? Math.min(1, (isNow - was) / (1 - was)) : 1;
+          const sweepMax = (FOLLOW_ORIENT_MAX_DPS * dt) / 1000;
+          cam.bearing += Math.max(-sweepMax, Math.min(sweepMax, toAim * share));
+        } else {
+          /*
+           * Settled: ease toward the heading, then clamp how far that rotation was
+           * allowed to get this frame. The ease is front-loaded by nature — its first
+           * frames of a correction are its fastest — so the ceiling, not the ease, is
+           * what keeps a bend reading as a slow pan.
+           */
+          const maxStep = (FOLLOW_TURN_MAX_DPS * dt) / 1000;
+          cam.bearing += Math.max(-maxStep, Math.min(maxStep, toAim * kTurn));
+        }
 
         map.jumpTo({ center: cam.center, zoom: cam.zoom, bearing: cam.bearing, pitch: cam.pitch });
       }

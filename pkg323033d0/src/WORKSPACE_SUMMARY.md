@@ -237,11 +237,26 @@ Deleted from the template: `pages/Dashboard/` and `data/sampleData.ts` (dummy da
     dive `flyTo` is still in flight when playback starts (`map.stop()` cancels it), and the
     pull-back had to move out of the dwell timer into `onPlaybackEnd` or it eased out from
     underneath the ride-along. Smoothing is normalised for frame time
-    (`k = 1 - (1 - ease)^(dt/16.7)`) so the feel does not change with frame rate, bearing comes
-    from the trail rather than the raw segment (a single short OSM segment would snap the view),
-    and the first 900 ms is itself eased so the chase *continues* the dive instead of competing
+    (`k = 1 - (1 - ease)^(dt/16.7)`) so the feel does not change with frame rate, and zoom and
+    pitch are blended in over 1.4 s so the chase *continues* the dive instead of competing
     with it. The viewer's hand always wins: a drag or wheel releases the camera for the rest of
     the run, and under `prefers-reduced-motion` the whole chase is skipped and the old framing
     behaviour stands. Arrival flashes are deliberately only **two marked moments** — amber at the
     scene, white at the hospital doors — and the loop is kept alive past `finished` by an
     `endedAt` latch so the last flash is not deleted on the frame it was created.
+22. **The chase aims at where the road is *going*, not where it points right now.** Nine seconds
+    of playback covers a couple of kilometres, so a corner is over in about half a second: a
+    camera aimed at the local heading has to whip round for every turn, and at any rate slow
+    enough to look calm it never catches up at all — it just rotates continuously for the whole
+    drive. (The first cut did exactly that; a numeric simulation of the loop showed the camera
+    rotation-bound for all nine seconds and the zoom never once reaching its target.) So the aim
+    is the average heading of the last **600 m**, which a single turn barely moves, and the
+    rotation is capped at **24°/s**. A corner is answered by *rising* instead: a short 150 m
+    heading compared against the long one measures how hard the road is bending — independent of
+    the camera's own lag — and that lifts the camera up to 0.85 zoom levels and lays the pitch
+    back 9°, slowly, then returns it. On a straight arterial the camera is now completely still.
+    Each leg still opens with one deliberate establishing sweep onto its heading, because the
+    dive leaves the camera facing anywhere and the transport leg can set off back the way the
+    unit came; that sweep is budgeted by **rate** (55°/s average, ease-in-out *sine* — cubic
+    peaks at 3× its average and reads as a whip pan) rather than by a fixed window, so a small
+    correction is not stretched into a crawl and a half-turn is not compressed into a snap.

@@ -78,7 +78,7 @@ before/after wipe, hospital beacon columns, persisted incidents, a road-critical
 
 | Route | Component | Shows |
 | --- | --- | --- |
-| `/` | `pages/Ops/Ops.tsx` | **The control room** — the demo surface, and deliberately only two gestures: *pick a condition* and *click a point*. Clicking anywhere on the map, or any venue marker, dispatches to that point: the camera dives onto it, the engine solves, and the camera then pulls back until the whole journey is in shot with both legs drawn and animated. The answer lands in one bottom-centre card — fastest hospital, responding station, total, and the two legs. Flipping the conditions switch (*Normal* ⇄ *Post-game + flood*) recolours every road by traffic, floods John Nolen Drive, washes in the crowd zones, pulses a ring out of Camp Randall — and **re-solves the open incident**, so the viewer watches the destination hospital itself change. Chrome is two panels top-left (Conditions, with just *Response avg* and *Times slower*; and Map key) plus keyboard shortcuts (space / R / Esc). |
+| `/` | `pages/Ops/Ops.tsx` | **The control room** — the demo surface, and deliberately only two gestures: *pick a condition* and *click a point*. Clicking anywhere on the map, or any venue marker, dispatches to that point in **three camera moves**: dive onto the point, then *ride along with the ambulance* (a low pitched chase camera that turns with the route, lifts at the hospital hand-off and flashes a ring at each arrival), then pull back until the whole journey is in shot. The answer lands in one bottom-centre card — fastest hospital, responding station, total, and the two legs. Flipping the conditions switch (*Normal* ⇄ *Post-game + flood*) recolours every road by traffic, floods John Nolen Drive, washes in the crowd zones, pulses a ring out of Camp Randall — and **re-solves the open incident**, so the viewer watches the destination hospital itself change. Chrome is the ISTHMUS wordmark and two panels top-left (Conditions, with just *Response avg* and *Times slower*; and Map key) plus keyboard shortcuts (space / R / Esc); the column is height-capped so it can never collide with MapLibre's own scale bar and credit. |
 | `/model` | `pages/CityModel/CityModel.tsx` | The base twin in 3D: extruded buildings, network, facilities, venues, layer toggles, a height/confidence shading switch, legend, and both the speed and building-height estimated-vs-observed splits. |
 | `/dispatch` | `pages/Dispatch/Dispatch.tsx` | Click-to-place incident → both legs drawn, timed and **animated** (a vehicle head traces the route, clock counting modelled drive seconds) with a Replay control, ranked candidate hospitals and stations, and the engine's `warnings` rendered verbatim. |
 | `/provenance` | `pages/Provenance/Provenance.tsx` | Source, licence, checksum, live-vs-manifest row counts, scenario assumptions, building-height provenance, and the "empty on purpose" table. |
@@ -92,13 +92,19 @@ Shared frontend code:
   Scenario layers added in draw order: `zones-fill`/`zones-edge` (crowd wash, drawn *under* the
   buildings so the city rises out of it) → `roads-flood` (wide, blurred lake navy) → `roads-glow`
   (wide blurry under-stroke, opacity = congestion) → `roads` (thin sharp over-stroke) →
-  `roads-closed` (dashed, breathing opacity) → bridges/routes → `pulse-ring`. Props
+  `roads-closed` (dashed, breathing opacity) → bridges/routes → `pulse-ring` → `arrival-ring`
+  (expanding rings at each arrival; its own `arrival` source, because the stadium pulse rewrites
+  `pulse` every frame). Props
   `trafficMode` / `crowdZones` / `pulseOrigin` / `resetToken` drive the scenario look.
   Camera and interaction props: `focus`+`focusToken` dives to a point, `frame`+`frameToken` eases
   out to fit a bbox (the two halves of the dispatch move), `roadInspect` (default **true**) gates
   the click-a-road popup so the control room can spend a click on dispatching instead, and
-  `onVenueSelect` turns venue markers from popups into dispatch buttons. The last two default to
-  the old behaviour, so `/model` and `/dispatch` are untouched by the control-room rework. One
+  `onVenueSelect` turns venue markers from popups into dispatch buttons. `followRoute` (default
+  **false**) turns route playback into a chase camera that rides with the vehicle head, and
+  `onPlaybackEnd` fires on arrival so the caller can decide what the camera does next;
+  `showDriveClock` (default **true**) hides the in-map drive-time readout, which the control room
+  turns off because it sits under the wordmark. Every one of these defaults to the old behaviour,
+  so `/model` and `/dispatch` are untouched by the control-room rework. One
   `requestAnimationFrame` loop serves both the pulse and the closed-road breathing, and it draws a
   single static frame instead under `prefers-reduced-motion`.
 - `components/Ops/OpsChrome.tsx` + `ops.css` — the control-room instrument kit: `GlassPanel`,
@@ -226,3 +232,16 @@ Deleted from the template: `pages/Dashboard/` and `data/sampleData.ts` (dummy da
     `EmsRouter` kept returning the old (null) answer until the workspace caches were cleared; the
     logic had been right for several minutes. Verify a backend change against the data before
     assuming the change itself was wrong.
+21. **One camera, three moves, and only one of them at a time.** The chase camera writes
+    `map.jumpTo` every frame, so anything else driving the transform silently wins: the 2,600 ms
+    dive `flyTo` is still in flight when playback starts (`map.stop()` cancels it), and the
+    pull-back had to move out of the dwell timer into `onPlaybackEnd` or it eased out from
+    underneath the ride-along. Smoothing is normalised for frame time
+    (`k = 1 - (1 - ease)^(dt/16.7)`) so the feel does not change with frame rate, bearing comes
+    from the trail rather than the raw segment (a single short OSM segment would snap the view),
+    and the first 900 ms is itself eased so the chase *continues* the dive instead of competing
+    with it. The viewer's hand always wins: a drag or wheel releases the camera for the rest of
+    the run, and under `prefers-reduced-motion` the whole chase is skipped and the old framing
+    behaviour stands. Arrival flashes are deliberately only **two marked moments** — amber at the
+    scene, white at the hospital doors — and the loop is kept alive past `finished` by an
+    `endedAt` latch so the last flash is not deleted on the frame it was created.

@@ -252,8 +252,9 @@ export default function Ops() {
             if (myReq !== reqIdRef.current) return;
             setPlan(p);
             setSolving(false);
-            // Step two: pull back until the whole journey is in shot.
-            setFrameToken((t) => t + 1);
+            // Step two is the ride-along, which the map starts as soon as it has the
+            // legs. The pull-back is step three and waits for `onPlaybackEnd` — fired
+            // here it would run underneath the chase camera and cancel it.
           }, wait);
         })
         .catch((err: unknown) => {
@@ -275,6 +276,17 @@ export default function Ops() {
     (venue: Venue) => dispatchTo(venue.latitude, venue.longitude, venue.name, scenarioId),
     [dispatchTo, scenarioId],
   );
+
+  /**
+   * The last beat of the dispatch: the unit has arrived, so lift out of the chase and
+   * show the whole journey that was just driven.
+   *
+   * No staleness guard is needed here, unlike in {@link dispatchTo}. A new click
+   * clears the plan, which empties the map's legs and tears down the animation before
+   * it can report finishing — and the extent this pulls back to is derived from
+   * whatever plan is current, so even a late call frames the right journey.
+   */
+  const handlePlaybackEnd = useCallback(() => setFrameToken((t) => t + 1), []);
 
   const clearIncident = useCallback(() => {
     reqIdRef.current++;
@@ -476,6 +488,9 @@ export default function Ops() {
         /* The map's own drive-time clock lives in the canvas's top-left corner, which
          * here belongs to the wordmark. The same seconds are on the answer card. */
         showDriveClock={false}
+        /* Ride along with the unit, then pull back when it arrives. */
+        followRoute
+        onPlaybackEnd={handlePlaybackEnd}
         bounds={bounds}
         focus={focus}
         focusToken={focusToken}

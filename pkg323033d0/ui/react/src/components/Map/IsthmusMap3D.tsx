@@ -167,6 +167,21 @@ export interface IsthmusMap3DProps {
    */
   showDriveClock?: boolean;
   /**
+   * Whether the camera rides along with the unit during playback — down onto the
+   * responding vehicle, banking through the turns behind it, lifting for a beat as it
+   * reaches the scene, then following the patient to the hospital.
+   *
+   * Three consequences worth knowing before switching this on:
+   * - It **cancels any camera animation in flight** when playback starts, because a
+   *   running `flyTo` writes the transform every frame and would simply overrule it.
+   * - It **hands control back the moment the viewer drags or scrolls**. A camera that
+   *   fights the mouse feels broken, so the first gesture ends the shot for good.
+   * - The pull-back to {@link IsthmusMap3DProps.frame} should be triggered from
+   *   {@link IsthmusMap3DProps.onPlaybackEnd} rather than when the route arrives, or
+   *   the two camera moves run at once and neither one reads.
+   */
+  followRoute?: boolean;
+  /**
    * Called when a venue marker is clicked. When supplied, venue markers dispatch
    * instead of opening their own popup, so "click any point or venue" is one gesture
    * with one outcome rather than two different behaviours on the same map.
@@ -187,7 +202,64 @@ const SKY_COLOR = '#0a1522';
 /** Whole-journey playback length. Both legs share it in proportion to real drive time. */
 const PLAYBACK_SECONDS = 9;
 
+/* --- chase camera ---
+ *
+ * The shot that rides along with the unit. Every value here is tuned to one idea: the
+ * camera is a helicopter with a pilot, not a rail. It trails slightly behind the
+ * vehicle, it banks into turns a beat late, and it never reaches its target exactly —
+ * which is what separates "following" from "glued to".
+ */
+/** Height to settle at while following. Close enough to read street names. */
+const FOLLOW_ZOOM = 15.5;
+const FOLLOW_PITCH = 62;
+/**
+ * Per-frame approach fraction at 60 fps, normalised for real frame time below so a
+ * 120 Hz display does not chase twice as fast. Deliberately lazy: the lag is the shot.
+ */
+const FOLLOW_EASE = 0.085;
+/** Turning and zooming lag further behind than position — a camera has inertia. */
+const FOLLOW_TURN_EASE = 0.045;
+/**
+ * The breath at the hand-off. When the unit reaches the scene and the second leg
+ * begins, the camera lifts and settles back over this window, so the viewer feels the
+ * patient being loaded instead of reading a label that says so.
+ */
+const FOLLOW_LIFT_MS = 1200;
+const FOLLOW_LIFT_ZOOM = 1.25;
+
+/* --- arrival flash and vehicle beacon --- */
+/** How long an arrival ring takes to expand and fade out. */
+const FLASH_MS = 1150;
+/** How far it reaches, in metres on the ground. Local, not city-wide: this is a door. */
+const FLASH_RADIUS_M = 300;
+/** The halo around the moving unit at rest, restored whenever playback stops. */
+const HEAD_GLOW_OPACITY = 0.3;
+const HEAD_GLOW_NEAR = 10;
+const HEAD_GLOW_FAR = 22;
+/** Beacon period. Close to a real light bar without being a nightclub. */
+const BEACON_MS = 760;
+
 /* ----------------------------------------------------------------- helpers -- */
+
+function easeOutCubic(t: number): number {
+  return 1 - Math.pow(1 - t, 3);
+}
+
+/** Compass bearing a→b in MapLibre's degrees-clockwise-from-north. */
+function bearingBetween(a: [number, number], b: [number, number]): number {
+  const toRad = Math.PI / 180;
+  const y = Math.sin((b[0] - a[0]) * toRad) * Math.cos(b[1] * toRad);
+  const x =
+    Math.cos(a[1] * toRad) * Math.sin(b[1] * toRad) -
+    Math.sin(a[1] * toRad) * Math.cos(b[1] * toRad) * Math.cos((b[0] - a[0]) * toRad);
+  return (Math.atan2(y, x) * 180) / Math.PI;
+}
+
+/** Interpolates angles the short way round, so 350° → 10° turns 20° and not 340°. */
+function lerpAngle(from: number, to: number, t: number): number {
+  const delta = ((to - from + 540) % 360) - 180;
+  return from + delta * t;
+}
 
 function escapeHtml(value: string): string {
   return value
@@ -377,6 +449,7 @@ export default function IsthmusMap3D({
   frameToken = 0,
   roadInspect = true,
   showDriveClock = true,
+  followRoute = false,
   onVenueSelect,
   playToken = 0,
   onPlaybackEnd,
@@ -404,6 +477,10 @@ export default function IsthmusMap3D({
   // registration time would be frozen forever.
   const roadInspectRef = useRef(roadInspect);
   roadInspectRef.current = roadInspect;
+  // Read at playback start, inside an effect that is keyed on the route rather than on
+  // this flag — a ref keeps the decision current without restarting the animation.
+  const followRouteRef = useRef(followRoute);
+  followRouteRef.current = followRoute;
 
   /* --- map creation (once) --- */
   useEffect(() => {
@@ -501,6 +578,7 @@ export default function IsthmusMap3D({
         'route-head',
         'zones',
         'pulse',
+        'arrival',
       ]) {
         map.addSource(id, { type: 'geojson', data: emptyCollection() });
       }
@@ -745,6 +823,23 @@ export default function IsthmusMap3D({
           'line-opacity': ['get', 'op'],
           'line-width': ['get', 'lw'],
           'line-blur': 2,
+        },
+      });
+
+      /* --- arrival flashes ---------------------------------------------- */
+      // Its own source rather than a second use of `pulse`, which the stadium ring
+      // rewrites on every frame and would wipe this out from under itself. Two
+      // moments earn a flash and no others: reaching the patient, and reaching the
+      // hospital doors. Keeping it to those two is what makes them land.
+      map.addLayer({
+        id: 'arrival-ring',
+        type: 'line',
+        source: 'arrival',
+        paint: {
+          'line-color': ['get', 'color'],
+          'line-opacity': ['get', 'op'],
+          'line-width': ['get', 'lw'],
+          'line-blur': 1.4,
         },
       });
 
@@ -1232,10 +1327,35 @@ export default function IsthmusMap3D({
       rafRef.current = null;
     }
 
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const arrivalSrc = map.getSource('arrival') as GeoJSONSource | undefined;
+    /** Arrival rings currently expanding. At most two ever exist at once. */
+    const flashes: { at: [number, number]; t0: number; color: string }[] = [];
+    /** The leg the vehicle was on last frame, so a change means one just completed. */
+    let seenLeg = -1;
+    let endedAt = 0;
+
+    /** Puts the vehicle halo back to its resting size, so a parked head stops blinking. */
+    const restoreHeadGlow = () => {
+      if (!map.getLayer('route-head-glow')) return;
+      map.setPaintProperty('route-head-glow', 'circle-opacity', HEAD_GLOW_OPACITY);
+      map.setPaintProperty('route-head-glow', 'circle-radius', [
+        'interpolate',
+        ['linear'],
+        ['zoom'],
+        11,
+        HEAD_GLOW_NEAR,
+        15,
+        HEAD_GLOW_FAR,
+      ]);
+    };
+
     if (legs.length === 0) {
       planSrc.setData(emptyCollection());
       doneSrc.setData(emptyCollection());
       headSrc.setData(emptyCollection());
+      arrivalSrc?.setData(emptyCollection());
+      restoreHeadGlow();
       if (clockRef.current) clockRef.current.textContent = '';
       return;
     }
@@ -1251,6 +1371,43 @@ export default function IsthmusMap3D({
     const totalSeconds = legs.reduce((a, l) => a + Math.max(l.seconds, 0.001), 0);
     const durations = legs.map((l) => (Math.max(l.seconds, 0.001) / totalSeconds) * PLAYBACK_SECONDS * 1000);
 
+    /*
+     * The chase camera lives in this same loop on purpose. Driven from its own timer
+     * it could drift a frame or two out of step with the vehicle it is supposed to be
+     * following, and a shot that lags its subject inconsistently looks like a bug
+     * rather than like camerawork.
+     */
+    /*
+     * Reduced motion switches the ride-along, the beacon and the arrival flashes off,
+     * and leaves the framed pull-back to do the work. A camera that moves continuously
+     * for nine seconds is exactly what that setting exists to prevent, and the route
+     * itself still draws either way — only the flourishes are dropped.
+     */
+    const chasing = followRouteRef.current && !reduced;
+    const cam = {
+      center: [map.getCenter().lng, map.getCenter().lat] as [number, number],
+      zoom: map.getZoom(),
+      bearing: map.getBearing(),
+      pitch: map.getPitch(),
+      leg: -1,
+      legAt: 0,
+      released: false,
+      last: 0,
+    };
+    // A `flyTo` from the dive may still be in flight, and it writes the transform every
+    // frame — without this the chase would silently lose every frame to it.
+    if (chasing) map.stop();
+
+    // The viewer's hand always wins. One drag or one wheel tick ends the shot for good:
+    // a camera that springs back to its own idea of the right view feels broken.
+    const release = () => {
+      cam.released = true;
+    };
+    if (chasing) {
+      map.on('dragstart', release);
+      map.on('wheel', release);
+    }
+
     const start = performance.now();
     const step = (now: number) => {
       if (!mapRef.current || !loadedRef.current) return;
@@ -1258,6 +1415,8 @@ export default function IsthmusMap3D({
 
       const doneFeatures: Feature[] = [];
       let head: { point: [number, number]; color: string } | null = null;
+      let headLeg = -1;
+      let headTrail: [number, number][] | null = null;
       let finished = true;
 
       for (let i = 0; i < legs.length; i++) {
@@ -1270,6 +1429,8 @@ export default function IsthmusMap3D({
         const { coords, head: hp } = sliceLeg(legs[i], frac);
         doneFeatures.push(lineFeature(coords, { color: legs[i].color, label: legs[i].label }));
         head = { point: hp, color: legs[i].color };
+        headLeg = i;
+        headTrail = coords;
         finished = false;
         break;
       }
@@ -1293,10 +1454,122 @@ export default function IsthmusMap3D({
         clockRef.current.textContent = formatDuration(fraction * totalSeconds);
       }
 
+      /* --- the two moments worth marking ------------------------------- */
+      if (!reduced && headLeg !== seenLeg) {
+        if (seenLeg >= 0) {
+          // A leg just ended. Amber for reaching the patient — the same colour the
+          // stadium pulse uses for "this is where it is happening". White for the
+          // hospital doors, matching the vehicle itself: the run is complete.
+          const finishedLeg = legs[seenLeg];
+          flashes.push({
+            at: finishedLeg.coords[finishedLeg.coords.length - 1],
+            t0: now,
+            color: seenLeg === legs.length - 1 ? '#ffffff' : 'rgb(255, 176, 32)',
+          });
+        }
+        seenLeg = headLeg;
+      }
+
+      if (flashes.length > 0 && arrivalSrc) {
+        const ringFeatures: Feature[] = [];
+        for (let i = flashes.length - 1; i >= 0; i--) {
+          const age = (now - flashes[i].t0) / FLASH_MS;
+          if (age >= 1) {
+            flashes.splice(i, 1);
+            continue;
+          }
+          // Two rings a beat apart, each easing outward and fading as it widens.
+          for (const offset of [0, 0.22]) {
+            const p = age - offset;
+            if (p <= 0) continue;
+            ringFeatures.push(
+              polygonFeature(
+                circleRing(flashes[i].at[1], flashes[i].at[0], 18 + easeOutCubic(p) * FLASH_RADIUS_M, 72),
+                { color: flashes[i].color, op: 0.75 * (1 - p) * (1 - p), lw: 0.8 + 2.4 * (1 - p) },
+              ),
+            );
+          }
+        }
+        arrivalSrc.setData({ type: 'FeatureCollection', features: ringFeatures });
+      }
+
+      /* --- the light bar ----------------------------------------------- */
+      if (!reduced && head && map.getLayer('route-head-glow')) {
+        // A halo that breathes rather than a second colour: the unit reads as a live
+        // vehicle, and the palette stays at one accent plus the traffic three.
+        const beat = 0.5 + 0.5 * Math.sin((now / BEACON_MS) * Math.PI * 2);
+        const scale = 0.82 + 0.5 * beat;
+        map.setPaintProperty('route-head-glow', 'circle-opacity', 0.2 + 0.26 * beat);
+        map.setPaintProperty('route-head-glow', 'circle-radius', [
+          'interpolate',
+          ['linear'],
+          ['zoom'],
+          11,
+          HEAD_GLOW_NEAR * scale,
+          15,
+          HEAD_GLOW_FAR * scale,
+        ]);
+      }
+
+      /* --- ride along --------------------------------------------------- */
+      if (chasing && !cam.released && head && headLeg >= 0) {
+        if (headLeg !== cam.leg) {
+          cam.leg = headLeg;
+          cam.legAt = now;
+        }
+
+        /*
+         * Normalise the smoothing to real frame time. Without this the camera chases
+         * twice as fast on a 120 Hz display as on a 60 Hz one, which is the sort of
+         * difference that only ever shows up on the one machine used for the demo.
+         */
+        const dt = cam.last ? Math.min(64, now - cam.last) : 16.7;
+        cam.last = now;
+        const k = 1 - Math.pow(1 - FOLLOW_EASE, dt / 16.7);
+        const kTurn = 1 - Math.pow(1 - FOLLOW_TURN_EASE, dt / 16.7);
+
+        // Heading comes from the stretch just driven, so the camera banks the way the
+        // vehicle actually turned instead of pointing at a straight line to the end.
+        const trail = headTrail ?? [];
+        const from = trail.length >= 2 ? trail[trail.length - 2] : legs[headLeg].coords[0];
+        const aimed = metersBetween(from, head.point) > 1 ? bearingBetween(from, head.point) : cam.bearing;
+
+        // One lift as the second leg takes over: the unit has reached the scene.
+        const sinceLeg = now - cam.legAt;
+        const lift =
+          headLeg > 0 && sinceLeg < FOLLOW_LIFT_MS
+            ? Math.sin((sinceLeg / FOLLOW_LIFT_MS) * Math.PI) * FOLLOW_LIFT_ZOOM
+            : 0;
+        // Ease the target in over the first half second so the hand-over from the dive
+        // is a continuation of that move rather than a second, competing one.
+        const settle = easeOutCubic(Math.min(1, (now - start) / 900));
+        const wantZoom = cam.zoom + (FOLLOW_ZOOM - lift - cam.zoom) * settle;
+
+        cam.center = [
+          cam.center[0] + (head.point[0] - cam.center[0]) * k,
+          cam.center[1] + (head.point[1] - cam.center[1]) * k,
+        ];
+        cam.zoom += (wantZoom - cam.zoom) * k;
+        cam.bearing = lerpAngle(cam.bearing, aimed, kTurn);
+        cam.pitch += (FOLLOW_PITCH - cam.pitch) * kTurn;
+
+        map.jumpTo({ center: cam.center, zoom: cam.zoom, bearing: cam.bearing, pitch: cam.pitch });
+      }
+
       if (finished) {
-        rafRef.current = null;
-        if (playbackEndRef.current) playbackEndRef.current();
-        return;
+        // Report the arrival once, then keep the loop alive just long enough for the
+        // hospital flash to finish expanding — returning here would delete it on the
+        // very frame it was created.
+        if (!endedAt) {
+          endedAt = now;
+          restoreHeadGlow();
+          if (playbackEndRef.current) playbackEndRef.current();
+        }
+        if (flashes.length === 0) {
+          arrivalSrc?.setData(emptyCollection());
+          rafRef.current = null;
+          return;
+        }
       }
       rafRef.current = requestAnimationFrame(step);
     };
@@ -1308,6 +1581,14 @@ export default function IsthmusMap3D({
         cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
       }
+      if (chasing) {
+        map.off('dragstart', release);
+        map.off('wheel', release);
+      }
+      // A run cut short by a new dispatch must not leave a half-expanded ring or a
+      // blinking halo behind for the next one to inherit.
+      arrivalSrc?.setData(emptyCollection());
+      restoreHeadGlow();
     };
   }, [legs, playToken, ready]);
 
